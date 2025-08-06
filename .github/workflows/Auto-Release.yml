@@ -11,7 +11,6 @@ on:
         description: '特定工作流运行的ID（可选）'
         required: false
 
-# 关键修复：提升令牌权限
 permissions:
   contents: write
   actions: read
@@ -27,11 +26,15 @@ jobs:
         run: |
           if [ "${{ github.event_name }}" = "workflow_run" ]; then
             echo "run_id=${{ github.event.workflow_run.id }}" >> $GITHUB_OUTPUT
+            echo "tag=release-auto-${{ github.event.workflow_run.id }}" >> $GITHUB_OUTPUT
           elif [ -n "${{ github.event.inputs.run-id }}" ]; then
             echo "run_id=${{ github.event.inputs.run-id }}" >> $GITHUB_OUTPUT
+            echo "tag=release-manual-${{ github.event.inputs.run-id }}" >> $GITHUB_OUTPUT
           else
-            # 获取最近成功的运行
-            echo "run_id=$(gh run list --workflow=Build_oneplus_sm8750.yml --json=databaseId,conclusion,status --jq='.[] | select(.status=="completed" and .conclusion=="success") | .databaseId' --limit 1)" >> $GITHUB_OUTPUT
+            # 获取最近成功的运行ID并创建有效标签
+            run_id=$(gh run list --workflow=Build_oneplus_sm8750.yml --json=databaseId,conclusion,status --jq='first(.[] | select(.status=="completed" and .conclusion=="success") | .databaseId)')
+            echo "run_id=$run_id" >> $GITHUB_OUTPUT
+            echo "tag=release-auto-$run_id" >> $GITHUB_OUTPUT
           fi
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -41,12 +44,15 @@ jobs:
         id: get_artifact
         run: |
           # 获取该运行的所有构建产物
-          artifacts=$(gh run download ${{ steps.resolve_run_id.outputs.run_id }} --repo $GITHUB_REPOSITORY --dir /tmp/artifacts --pattern '*')
+          gh run download ${{ steps.resolve_run_id.outputs.run_id }} --repo $GITHUB_REPOSITORY --dir /tmp/artifacts
           
-          # 找到实际文件（绕过 GitHub 的打包方式）
-          artifact_path=$(find /tmp/artifacts -type f ! -name '*.zip' | head -1)
+          # 找到实际文件（GitHub 默认打包成 zip，需要解压）
+          unzip /tmp/artifacts/*.zip -d /tmp/extracted
+          artifact_path=$(find /tmp/extracted -type f ! -name '*.manifest' | head -1)
           artifact_name=$(basename "$artifact_path")
-          release_title=$(basename "$artifact_path" | cut -f 1 -d '.')
+          
+          # 文件名作为 Release 标题
+          release_title=$(basename "$artifact_path" | sed 's/\.[^.]*$//')
           
           echo "artifact_path=$artifact_path" >> $GITHUB_OUTPUT
           echo "artifact_name=$artifact_name" >> $GITHUB_OUTPUT
@@ -54,15 +60,20 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-      # 3. 创建 Release
+      # 3. 创建 Release 使用有效的标签格式
       - name: Create Release
         id: create_release
         uses: softprops/action-gh-release@v1
         with:
-          tag_name: release-${{ steps.resolve_run_id.outputs.run_id }}
+          # 使用有效的标签格式：前缀 + 时间戳 + 运行ID
+          tag_name: release-${{ github.run_id }}-${{ steps.resolve_run_id.outputs.run_id }}
           name: ${{ steps.get_artifact.outputs.release_title }}
           draft: false
           prerelease: false
+          # 自动生成变更日志
+          generate_release_notes: true
+          # 如果标签已存在则跳过创建
+          skip_if_tag_exists: true
 
       # 4. 上传构建产物
       - name: Upload Release Asset
@@ -71,3 +82,5 @@ jobs:
           upload_url: ${{ steps.create_release.outputs.upload_url }}
           asset_path: ${{ steps.get_artifact.outputs.artifact_path }}
           asset_name: ${{ steps.get_artifact.outputs.artifact_name }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
