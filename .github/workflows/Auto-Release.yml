@@ -1,126 +1,77 @@
-name: Auto-Release Builder
+name: Release Artifact
 
 on:
   workflow_run:
     workflows: ["Build_oneplus_sm8750"]
-    types: [completed]
-  
+    types:
+      - completed
   workflow_dispatch:
     inputs:
-      run_id:
-        description: "上游工作流运行ID（可选）"
+      run-id:
+        description: '特定工作流运行的ID（可选）'
         required: false
-        default: "latest"
-        type: string
-
-permissions:
-  actions: read
-  contents: write
 
 jobs:
-  create-release:
-    if: ${{ github.event.workflow_run.conclusion == 'success' || github.event_name == 'workflow_dispatch' }}
+  release:
     runs-on: ubuntu-latest
-    
     steps:
-      # 步骤1：确定要使用的上游工作流运行ID
-      - name: Determine workflow run ID
-        id: set-run-id
+      # 获取运行ID（自动或手动）
+      - name: Resolve Workflow Run ID
+        id: resolve_run_id
         run: |
-          if [[ "${{ github.event_name }}" == "workflow_run" ]]; then
-            RUN_ID=${{ github.event.workflow_run.id }}
+          if [ "${{ github.event_name }}" = "workflow_run" ]; then
+            echo "run_id=${{ github.event.workflow_run.id }}" >> $GITHUB_OUTPUT
+          elif [ -n "${{ github.event.inputs.run-id }}" ]; then
+            echo "run_id=${{ github.event.inputs.run-id }}" >> $GITHUB_OUTPUT
           else
-            if [[ "${{ github.event.inputs.run_id }}" != "latest" ]]; then
-              RUN_ID="${{ github.event.inputs.run_id }}"
-            else
-              # 查询最近一次成功的上游工作流运行
-              response=$(curl -s \
-                -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
-                -H "Accept: application/vnd.github.v3+json" \
-                "https://api.github.com/repos/${{ github.repository }}/actions/workflows/Build_oneplus_sm8750.yml/runs?status=success&per_page=1")
-              
-              RUN_ID=$(echo "$response" | jq -r '.workflow_runs[0].id')
-            fi
+            # 获取最近成功运行的ID
+            echo "run_id=$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/Build_oneplus_sm8750.yml/runs?status=success&per_page=1" -q '.workflow_runs[0].id')" >> $GITHUB_OUTPUT
           fi
-          
-          echo "使用的上游工作流ID: $RUN_ID"
-          echo "run_id=$RUN_ID" >> $GITHUB_OUTPUT
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-      # 步骤2：获取制品信息
-      - name: Get artifact information
-        id: artifact-info
-        uses: actions/github-script@v6
-        with:
-          script: |
-            const runId = ${{ steps.set-run-id.outputs.run_id }};
-            const artifacts = await github.rest.actions.listWorkflowRunArtifacts({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              run_id: runId,
-            });
-            
-            const validArtifacts = artifacts.data.artifacts.filter(a => a.expired === false);
-            
-            if (validArtifacts.length === 0) {
-              core.setFailed('❌ 没有找到有效的制品文件');
-            }
-            
-            // 获取第一个有效制品信息
-            const artifact = validArtifacts[0];
-            
-            return {
-              id: artifact.id,
-              name: artifact.name,
-              size: artifact.size_in_bytes,
-              download_url: `https://github.com/${{ github.repository }}/suites/actions/runs/${runId}/artifacts/${artifact.id}`
-            };
-
-      # 步骤3：处理文件名（移除扩展名）
-      - name: Process filename for release title
-        id: filename-processor
+      # 获取产物信息
+      - name: Get Artifact Metadata
+        id: get_artifact
         run: |
-          # 获取制品原始名称
-          ARTIFACT_NAME="${{ steps.artifact-info.outputs.result.name }}"
+          artifact_info=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/${{ steps.resolve_run_id.outputs.run_id }}/artifacts" \
+            -q '.artifacts[0]')
           
-          # 移除所有文件扩展名（直到最后一个小数点之前的部分）
-          BASE_NAME="${ARTIFACT_NAME%%.*}"
+          artifact_name=$(jq -r '.name' <<< "$artifact_info")
+          download_url=$(jq -r '.archive_download_url' <<< "$artifact_info")
+          release_title=$(basename -s .zip "$artifact_name")
           
-          # 如果移除扩展名后结果为空，则使用原始名称
-          if [ -z "$BASE_NAME" ]; then
-            BASE_NAME="$ARTIFACT_NAME"
-          fi
-          
-          echo "原始制品名称: $ARTIFACT_NAME"
-          echo "Release标题: $BASE_NAME"
-          
-          echo "artifact_full_name=$ARTIFACT_NAME" >> $GITHUB_OUTPUT
-          echo "release_title=$BASE_NAME" >> $GITHUB_OUTPUT
+          echo "artifact_name=$artifact_name" >> $GITHUB_OUTPUT
+          echo "download_url=$download_url" >> $GITHUB_OUTPUT
+          echo "release_title=$release_title" >> $GITHUB_OUTPUT
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-      # 步骤4：下载原始制品（ZIP格式）
-      - name: Download artifact
+      # 下载产物
+      - name: Download Artifact
         run: |
-          ARTIFACT_ID=${{ steps.artifact-info.outputs.result.id }}
-          DOWNLOAD_URL=${{ steps.artifact-info.outputs.result.download_url }}
-          
-          # 下载制品
           curl -L -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
-            -o "${{ steps.filename-processor.outputs.artifact_full_name }}.zip" \
-            "$DOWNLOAD_URL"
-          
-          # 记录下载状态
-          ls -lh
+            -o "${{ steps.get_artifact.outputs.artifact_name }}" \
+            "${{ steps.get_artifact.outputs.download_url }}"
 
-      # 步骤5：创建发布并上传原始ZIP制品
+      # 创建Release
       - name: Create Release
-        id: create-release
-        uses: softprops/action-gh-release@v1
+        id: create_release
+        uses: actions/create-release@v1
         with:
-          tag_name: "build-${{ steps.set-run-id.outputs.run_id }}"
-          name: ${{ steps.filename-processor.outputs.release_title }}
-          body: |
-            由工作流运行 #${{ steps.set-run-id.outputs.run_id }} 自动创建
-            - 原始文件名: ${{ steps.artifact-info.outputs.result.name }}
-            - 文件大小: ${{ steps.artifact-info.outputs.result.size }} bytes
+          tag_name: release-${{ github.run_id }}
+          release_name: ${{ steps.get_artifact.outputs.release_title }}
           draft: false
           prerelease: false
-          files: ${{ steps.filename-processor.outputs.artifact_full_name }}.zip
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # 上传产物到Release
+      - name: Upload Release Asset
+        uses: actions/upload-release-asset@v1
+        with:
+          upload_url: ${{ steps.create_release.outputs.upload_url }}
+          asset_path: ${{ steps.get_artifact.outputs.artifact_name }}
+          asset_name: ${{ steps.get_artifact.outputs.artifact_name }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
