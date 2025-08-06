@@ -1,0 +1,86 @@
+name: Auto-Release Builder
+
+on:
+  workflow_run:
+    workflows: ["Build_oneplus_sm8750"]
+    types: [completed]
+
+jobs:
+  create-release:
+    if: ${{ github.event.workflow_run.conclusion == 'success' }}
+    runs-on: ubuntu-latest
+    steps:
+      # 检查触发工作流的运行结果
+      - name: Verify upstream workflow
+        run: |
+          echo "Triggered by workflow run #${{ github.event.workflow_run.id }}"
+          echo "Conclusion: ${{ github.event.workflow_run.conclusion }}"
+        
+      # 获取上游工作流生成的制品
+      - name: Download artifacts
+        uses: actions/github-script@v6
+        id: fetch-artifact
+        with:
+          script: |
+            const artifacts = await github.rest.actions.listWorkflowRunArtifacts({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              run_id: ${{ github.event.workflow_run.id }},
+            });
+            
+            const validArtifacts = artifacts.data.artifacts.filter(a => a.expired === false);
+            
+            if (validArtifacts.length === 0) {
+              core.setFailed('No valid artifacts found');
+            }
+            
+            const artifact = validArtifacts[0];  // 取第一个有效制品
+            const download = await github.rest.actions.downloadArtifact({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              artifact_id: artifact.id,
+              archive_format: 'zip',
+            });
+            
+            // 保存原始文件名用于后续处理
+            const fileName = artifact.name;
+            return fileName;
+
+      # 处理文件名并提取基础名
+      - name: Extract filename
+        id: filename-processor
+        run: |
+          ORIGINAL_NAME="${{ steps.fetch-artifact.outputs.result }}"
+          # 删除文件扩展名（处理多层扩展如.tar.gz）
+          BASE_NAME="${ORIGINAL_NAME%.*}"
+          BASE_NAME="${BASE_NAME%.*}"  # 二次处理确保移除多层扩展
+          
+          echo "Original name: $ORIGINAL_NAME"
+          echo "Base name: $BASE_NAME"
+          
+          echo "original_file=$ORIGINAL_NAME" >> $GITHUB_OUTPUT
+          echo "release_title=$BASE_NAME" >> $GITHUB_OUTPUT
+      
+      # 创建Release
+      - name: Create Release
+        id: create-release
+        uses: actions/create-release@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag_name: "build-${{ github.event.workflow_run.run_number }}"
+          release_name: ${{ steps.filename-processor.outputs.release_title }}
+          draft: false
+          prerelease: false
+          body: "Automated release from workflow run #${{ github.event.workflow_run.id }}"
+
+      # 上传制品到Release
+      - name: Upload Artifact
+        uses: actions/upload-release-asset@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          upload_url: ${{ steps.create-release.outputs.upload_url }}
+          asset_path: ${{ github.event.workflow_run.artifacts_url }}/${{ steps.filename-processor.outputs.original_file }}
+          asset_name: ${{ steps.filename-processor.outputs.original_file }}
+          asset_content_type: application/octet-stream
