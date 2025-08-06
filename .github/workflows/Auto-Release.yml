@@ -20,67 +20,77 @@ jobs:
   release:
     runs-on: ubuntu-latest
     steps:
-      # 1. 确定要使用的运行ID
+      # 1. 安装 GitHub CLI (gh)
+      - name: Install GitHub CLI
+        run: |
+          curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg | sudo dd of=/usr/share/keyrings/githubcli-archive-keyring.gpg
+          echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" | sudo tee /etc/apt/sources.list.d/github-cli.list >/dev/null
+          sudo apt update && sudo apt install -y gh
+
+      # 2. 确定要使用的运行ID（修复版）
       - name: Resolve Workflow Run ID
         id: resolve_run_id
         run: |
           if [ "${{ github.event_name }}" = "workflow_run" ]; then
-            echo "run_id=${{ github.event.workflow_run.id }}" >> $GITHUB_OUTPUT
-            echo "tag=release-auto-${{ github.event.workflow_run.id }}" >> $GITHUB_OUTPUT
+            run_id="${{ github.event.workflow_run.id }}"
+            echo "run_id=$run_id" >> $GITHUB_OUTPUT
+            echo "tag=release-auto-$run_id" >> $GITHUB_OUTPUT
           elif [ -n "${{ github.event.inputs.run-id }}" ]; then
-            echo "run_id=${{ github.event.inputs.run-id }}" >> $GITHUB_OUTPUT
-            echo "tag=release-manual-${{ github.event.inputs.run-id }}" >> $GITHUB_OUTPUT
+            run_id="${{ github.event.inputs.run-id }}"
+            echo "run_id=$run_id" >> $GITHUB_OUTPUT
+            echo "tag=release-manual-$run_id" >> $GITHUB_OUTPUT
           else
-            # 获取最近成功的运行ID并创建有效标签
-            run_id=$(gh run list --workflow=Build_oneplus_sm8750.yml --json=databaseId,conclusion,status --jq='first(.[] | select(.status=="completed" and .conclusion=="success") | .databaseId)')
+            # 直接使用API获取最近成功的运行（绕过gh命令）
+            response=$(curl -s -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github.v3+json" \
+              "https://api.github.com/repos/$GITHUB_REPOSITORY/actions/runs?event=push&status=completed&conclusion=success&workflow=Build_oneplus_sm8750.yml&per_page=1")
+            run_id=$(echo "$response" | jq -r '.workflow_runs[0].id')
             echo "run_id=$run_id" >> $GITHUB_OUTPUT
             echo "tag=release-auto-$run_id" >> $GITHUB_OUTPUT
           fi
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-      # 2. 获取构建产物的信息
+      # 3. 获取构建产物的信息
       - name: Get Artifact Metadata
         id: get_artifact
         run: |
-          # 获取该运行的所有构建产物
-          gh run download ${{ steps.resolve_run_id.outputs.run_id }} --repo $GITHUB_REPOSITORY --dir /tmp/artifacts
+          # 直接使用API获取产物信息
+          response=$(curl -s -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github.v3+json" \
+            "https://api.github.com/repos/$GITHUB_REPOSITORY/actions/runs/${{ steps.resolve_run_id.outputs.run_id }}/artifacts")
+          artifact_name=$(echo "$response" | jq -r '.artifacts[0].name')
+          artifact_id=$(echo "$response" | jq -r '.artifacts[0].id')
           
-          # 找到实际文件（GitHub 默认打包成 zip，需要解压）
-          unzip /tmp/artifacts/*.zip -d /tmp/extracted
+          # 下载产物
+          curl -L -H "Authorization: Bearer $GH_TOKEN" \
+            -o "/tmp/$artifact_name" \
+            "https://api.github.com/repos/$GITHUB_REPOSITORY/actions/artifacts/$artifact_id/zip"
+          
+          # 解压产物
+          unzip -q "/tmp/$artifact_name" -d /tmp/extracted
           artifact_path=$(find /tmp/extracted -type f ! -name '*.manifest' | head -1)
-          artifact_name=$(basename "$artifact_path")
-          
-          # 文件名作为 Release 标题
           release_title=$(basename "$artifact_path" | sed 's/\.[^.]*$//')
           
           echo "artifact_path=$artifact_path" >> $GITHUB_OUTPUT
-          echo "artifact_name=$artifact_name" >> $GITHUB_OUTPUT
           echo "release_title=$release_title" >> $GITHUB_OUTPUT
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-      # 3. 创建 Release 使用有效的标签格式
+      # 4. 创建 Release
       - name: Create Release
         id: create_release
         uses: softprops/action-gh-release@v1
         with:
-          # 使用有效的标签格式：前缀 + 时间戳 + 运行ID
-          tag_name: release-${{ github.run_id }}-${{ steps.resolve_run_id.outputs.run_id }}
+          tag_name: ${{ steps.resolve_run_id.outputs.tag }}
           name: ${{ steps.get_artifact.outputs.release_title }}
           draft: false
           prerelease: false
-          # 自动生成变更日志
           generate_release_notes: true
-          # 如果标签已存在则跳过创建
           skip_if_tag_exists: true
 
-      # 4. 上传构建产物
+      # 5. 上传构建产物
       - name: Upload Release Asset
         uses: actions/upload-release-asset@v1
         with:
           upload_url: ${{ steps.create_release.outputs.upload_url }}
           asset_path: ${{ steps.get_artifact.outputs.artifact_path }}
-          asset_name: ${{ steps.get_artifact.outputs.artifact_name }}
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          asset_name: $(basename ${{ steps.get_artifact.outputs.artifact_path }})
