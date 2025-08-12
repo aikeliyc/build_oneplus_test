@@ -10,6 +10,7 @@ on:
           - 'oneplus_13'
           - 'oneplus_ace5_pro'
           - 'oneplus_13t'
+          - 'oneplus_13s'
           - 'oneplus_pad_2_pro'
           - 'oneplus_ace5_ultra'
           - 'realme_GT7pro'
@@ -349,6 +350,9 @@ jobs:
               ;;
             oneplus_ace5_ultra)
               DEFAULT_SUFFIX="-android15-8-gfc70d29746a7-abogki412262948-4k"
+              ;;
+            oneplus_13s)
+              DEFAULT_SUFFIX="-android15-8-gd43086512890-abogki423825152-4k"
               ;;
           esac
           
